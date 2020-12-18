@@ -1,25 +1,26 @@
 use async_trait::async_trait;
-use std::{future::Future, net::Ipv4Addr};
-use trust_dns_resolver::{error::ResolveErrorKind, AsyncResolver};
+use std::net::IpAddr;
+use tokio::runtime::Handle;
+use trust_dns_resolver::{error::ResolveErrorKind, TokioAsyncResolver};
 
 #[async_trait]
 pub trait Lookup {
-    async fn lookup(&self, ip: Ipv4Addr) -> Option<String>;
+    async fn lookup(&self, ip: IpAddr) -> Option<String>;
 }
 
-pub struct Resolver(AsyncResolver);
+pub struct Resolver(TokioAsyncResolver);
 
 impl Resolver {
-    pub fn new() -> Result<(Self, impl Future<Output = ()>), failure::Error> {
-        let (resolver, background) = AsyncResolver::from_system_conf()?;
-        Ok((Self(resolver), background))
+    pub async fn new(runtime: Handle) -> Result<Self, failure::Error> {
+        let resolver = TokioAsyncResolver::from_system_conf(runtime).await?;
+        Ok(Self(resolver))
     }
 }
 
 #[async_trait]
 impl Lookup for Resolver {
-    async fn lookup(&self, ip: Ipv4Addr) -> Option<String> {
-        let lookup_future = self.0.reverse_lookup(ip.into());
+    async fn lookup(&self, ip: IpAddr) -> Option<String> {
+        let lookup_future = self.0.reverse_lookup(ip);
         match lookup_future.await {
             Ok(names) => {
                 // Take the first result and convert it to a string

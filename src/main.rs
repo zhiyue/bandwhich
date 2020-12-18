@@ -6,32 +6,32 @@ mod os;
 #[cfg(test)]
 mod tests;
 
-use display::{RawTerminalBackend, Ui};
+use display::{elapsed_time, RawTerminalBackend, Ui};
 use network::{
     dns::{self, IpTable},
-    Connection, Sniffer, Utilization,
+    Connection, LocalSocket, Sniffer, Utilization,
 };
 use os::OnSigWinch;
 
 use ::pnet::datalink::{DataLinkReceiver, NetworkInterface};
 use ::std::collections::HashMap;
-use ::std::sync::atomic::{AtomicBool, Ordering};
+use ::std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ::std::sync::{Arc, Mutex};
+use ::std::thread;
 use ::std::thread::park_timeout;
-use ::std::{thread, time};
 use ::termion::event::{Event, Key};
 use ::tui::backend::Backend;
 
 use std::process;
 
 use ::std::io;
-use ::std::time::Instant;
+use ::std::time::{Duration, Instant};
 use ::termion::raw::IntoRawMode;
 use ::tui::backend::TermionBackend;
-
+use std::sync::RwLock;
 use structopt::StructOpt;
 
-const DISPLAY_DELTA: time::Duration = time::Duration::from_millis(1000);
+const DISPLAY_DELTA: Duration = Duration::from_millis(1000);
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "bandwhich")]
@@ -45,6 +45,27 @@ pub struct Opt {
     #[structopt(short, long)]
     /// Do not attempt to resolve IPs to their hostnames
     no_resolve: bool,
+    #[structopt(flatten)]
+    render_opts: RenderOpts,
+    #[structopt(short, long)]
+    /// Show DNS queries
+    show_dns: bool,
+}
+
+#[derive(StructOpt, Debug, Copy, Clone)]
+pub struct RenderOpts {
+    #[structopt(short, long)]
+    /// Show processes table only
+    processes: bool,
+    #[structopt(short, long)]
+    /// Show connections table only
+    connections: bool,
+    #[structopt(short, long)]
+    /// Show remote addresses table only
+    addresses: bool,
+    #[structopt(short, long)]
+    /// Show total (cumulative) usages
+    total_utilization: bool,
 }
 
 fn main() {
@@ -79,10 +100,15 @@ fn try_main() -> Result<(), failure::Error> {
     Ok(())
 }
 
+pub struct OpenSockets {
+    sockets_to_procs: HashMap<LocalSocket, String>,
+    connections: Vec<Connection>,
+}
+
 pub struct OsInputOutput {
     pub network_interfaces: Vec<NetworkInterface>,
     pub network_frames: Vec<Box<dyn DataLinkReceiver>>,
-    pub get_open_sockets: fn() -> HashMap<Connection, String>,
+    pub get_open_sockets: fn() -> OpenSockets,
     pub keyboard_events: Box<dyn Iterator<Item = Event> + Send>,
     pub dns_client: Option<dns::Client>,
     pub on_winch: Box<OnSigWinch>,
@@ -95,6 +121,11 @@ where
     B: Backend + Send + 'static,
 {
     let running = Arc::new(AtomicBool::new(true));
+    let paused = Arc::new(AtomicBool::new(false));
+    let last_start_time = Arc::new(RwLock::new(Instant::now()));
+    let cumulative_time = Arc::new(RwLock::new(Duration::new(0, 0)));
+    let ui_offset = Arc::new(AtomicUsize::new(0));
+    let dns_shown = opts.show_dns;
 
     let mut active_threads = vec![];
 
@@ -108,7 +139,7 @@ where
     let raw_mode = opts.raw;
 
     let network_utilization = Arc::new(Mutex::new(Utilization::new()));
-    let ui = Arc::new(Mutex::new(Ui::new(terminal_backend)));
+    let ui = Arc::new(Mutex::new(Ui::new(terminal_backend, opts.render_opts)));
 
     if !raw_mode {
         active_threads.push(
@@ -116,11 +147,26 @@ where
                 .name("resize_handler".to_string())
                 .spawn({
                     let ui = ui.clone();
+                    let paused = paused.clone();
+                    let cumulative_time = cumulative_time.clone();
+                    let last_start_time = last_start_time.clone();
+                    let ui_offset = ui_offset.clone();
+
                     move || {
                         on_winch({
                             Box::new(move || {
                                 let mut ui = ui.lock().unwrap();
-                                ui.draw();
+                                let paused = paused.load(Ordering::SeqCst);
+                                ui.draw(
+                                    paused,
+                                    dns_shown,
+                                    elapsed_time(
+                                        *last_start_time.read().unwrap(),
+                                        *cumulative_time.read().unwrap(),
+                                        paused,
+                                    ),
+                                    ui_offset.load(Ordering::SeqCst),
+                                );
                             })
                         });
                     }
@@ -133,17 +179,27 @@ where
         .name("display_handler".to_string())
         .spawn({
             let running = running.clone();
+            let paused = paused.clone();
+            let ui_offset = ui_offset.clone();
+
             let network_utilization = network_utilization.clone();
+            let last_start_time = last_start_time.clone();
+            let cumulative_time = cumulative_time.clone();
+            let ui = ui.clone();
+
             move || {
                 while running.load(Ordering::Acquire) {
                     let render_start_time = Instant::now();
                     let utilization = { network_utilization.lock().unwrap().clone_and_reset() };
-                    let connections_to_procs = get_open_sockets();
+                    let OpenSockets {
+                        sockets_to_procs,
+                        connections,
+                    } = get_open_sockets();
                     let mut ip_to_host = IpTable::new();
                     if let Some(dns_client) = dns_client.as_mut() {
                         ip_to_host = dns_client.cache();
-                        let unresolved_ips = connections_to_procs
-                            .keys()
+                        let unresolved_ips = connections
+                            .iter()
                             .filter(|conn| !ip_to_host.contains_key(&conn.remote_socket.ip))
                             .map(|conn| conn.remote_socket.ip)
                             .collect::<Vec<_>>();
@@ -152,11 +208,21 @@ where
                     }
                     {
                         let mut ui = ui.lock().unwrap();
-                        ui.update_state(connections_to_procs, utilization, ip_to_host);
+                        let paused = paused.load(Ordering::SeqCst);
+                        let ui_offset = ui_offset.load(Ordering::SeqCst);
+                        if !paused {
+                            ui.update_state(sockets_to_procs, utilization, ip_to_host);
+                        }
+                        let elapsed_time = elapsed_time(
+                            *last_start_time.read().unwrap(),
+                            *cumulative_time.read().unwrap(),
+                            paused,
+                        );
+
                         if raw_mode {
                             ui.output_text(&mut write_to_stdout);
                         } else {
-                            ui.draw();
+                            ui.draw(paused, dns_shown, elapsed_time, ui_offset);
                         }
                     }
                     let render_duration = render_start_time.elapsed();
@@ -178,14 +244,44 @@ where
             .spawn({
                 let running = running.clone();
                 let display_handler = display_handler.thread().clone();
+
                 move || {
                     for evt in keyboard_events {
+                        let mut ui = ui.lock().unwrap();
+
                         match evt {
                             Event::Key(Key::Ctrl('c')) | Event::Key(Key::Char('q')) => {
                                 running.store(false, Ordering::Release);
                                 cleanup();
                                 display_handler.unpark();
                                 break;
+                            }
+                            Event::Key(Key::Char(' ')) => {
+                                let restarting = paused.fetch_xor(true, Ordering::SeqCst);
+                                if restarting {
+                                    *last_start_time.write().unwrap() = Instant::now();
+                                } else {
+                                    let last_start_time_copy = *last_start_time.read().unwrap();
+                                    let current_cumulative_time_copy =
+                                        *cumulative_time.read().unwrap();
+                                    let new_cumulative_time = current_cumulative_time_copy
+                                        + last_start_time_copy.elapsed();
+                                    *cumulative_time.write().unwrap() = new_cumulative_time;
+                                }
+
+                                display_handler.unpark();
+                            }
+                            Event::Key(Key::Char('\t')) => {
+                                let paused = paused.load(Ordering::SeqCst);
+                                let elapsed_time = elapsed_time(
+                                    *last_start_time.read().unwrap(),
+                                    *cumulative_time.read().unwrap(),
+                                    paused,
+                                );
+                                let table_count = ui.get_table_count();
+                                let new = ui_offset.load(Ordering::SeqCst) + 1 % table_count;
+                                ui_offset.store(new, Ordering::SeqCst);
+                                ui.draw(paused, dns_shown, elapsed_time, new);
                             }
                             _ => (),
                         };
@@ -203,12 +299,13 @@ where
         .map(|(iface, frames)| {
             let name = format!("sniffing_handler_{}", iface.name);
             let running = running.clone();
+            let show_dns = opts.show_dns;
             let network_utilization = network_utilization.clone();
 
             thread::Builder::new()
                 .name(name)
                 .spawn(move || {
-                    let mut sniffer = Sniffer::new(iface, frames);
+                    let mut sniffer = Sniffer::new(iface, frames, show_dns);
 
                     while running.load(Ordering::Acquire) {
                         if let Some(segment) = sniffer.next() {

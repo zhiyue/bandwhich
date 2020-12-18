@@ -3,12 +3,10 @@ use ::ipnetwork::IpNetwork;
 use ::pnet::datalink::DataLinkReceiver;
 use ::pnet::datalink::NetworkInterface;
 use ::std::collections::HashMap;
-use ::std::future::Future;
 use ::std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use ::std::pin::Pin;
-use ::std::task::{Context, Poll};
 use ::std::{thread, time};
 use ::termion::event::Event;
+use ::tokio::runtime::Runtime;
 
 use crate::{
     network::{
@@ -16,6 +14,7 @@ use crate::{
         Connection, Protocol,
     },
     os::OnSigWinch,
+    OpenSockets,
 };
 
 pub struct KeyboardEvents {
@@ -85,54 +84,65 @@ impl DataLinkReceiver for NetworkFrames {
     }
 }
 
-pub fn get_open_sockets() -> HashMap<Connection, String> {
+pub fn get_open_sockets() -> OpenSockets {
     let mut open_sockets = HashMap::new();
+    let local_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
     open_sockets.insert(
         Connection::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 12345),
+            local_ip,
             443,
             Protocol::Tcp,
-        )
-        .unwrap(),
+        ),
         String::from("1"),
     );
     open_sockets.insert(
         Connection::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)), 54321),
-            443,
+            local_ip,
+            4434,
             Protocol::Tcp,
-        )
-        .unwrap(),
+        ),
         String::from("4"),
     );
     open_sockets.insert(
         Connection::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3)), 1337),
-            443,
+            local_ip,
+            4435,
             Protocol::Tcp,
-        )
-        .unwrap(),
+        ),
         String::from("5"),
     );
     open_sockets.insert(
         Connection::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(4, 4, 4, 4)), 1337),
-            443,
+            local_ip,
+            4432,
             Protocol::Tcp,
-        )
-        .unwrap(),
+        ),
         String::from("2"),
     );
     open_sockets.insert(
         Connection::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 12346),
+            local_ip,
             443,
             Protocol::Tcp,
-        )
-        .unwrap(),
-        String::from("3"),
+        ),
+        String::from("1"),
     );
-    open_sockets
+    let mut local_socket_to_procs = HashMap::new();
+    let mut connections = std::vec::Vec::new();
+    for (connection, process_name) in open_sockets {
+        local_socket_to_procs.insert(connection.local_socket, process_name);
+        connections.push(connection);
+    }
+
+    OpenSockets {
+        sockets_to_procs: local_socket_to_procs,
+        connections,
+    }
 }
 
 pub fn get_interfaces() -> Vec<NetworkInterface> {
@@ -141,7 +151,10 @@ pub fn get_interfaces() -> Vec<NetworkInterface> {
         index: 42,
         mac: None,
         ips: vec![IpNetwork::V4("10.0.0.2".parse().unwrap())],
-        flags: 42,
+        // It's important that the IFF_LOOPBACK bit is set to 0.
+        // Otherwise sniffer will attempt to start parse packets
+        // at offset 14
+        flags: 0,
     }]
 }
 
@@ -155,7 +168,8 @@ pub fn create_fake_on_winch(should_send_winch_event: bool) -> Box<OnSigWinch> {
 }
 
 pub fn create_fake_dns_client(ips_to_hosts: HashMap<IpAddr, String>) -> Option<dns::Client> {
-    let dns_client = dns::Client::new(FakeResolver(ips_to_hosts), FakeBackground {}).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let dns_client = dns::Client::new(FakeResolver(ips_to_hosts), runtime).unwrap();
     Some(dns_client)
 }
 
@@ -163,18 +177,7 @@ struct FakeResolver(HashMap<IpAddr, String>);
 
 #[async_trait]
 impl Lookup for FakeResolver {
-    async fn lookup(&self, ip: Ipv4Addr) -> Option<String> {
-        let ip = IpAddr::from(ip);
+    async fn lookup(&self, ip: IpAddr) -> Option<String> {
         self.0.get(&ip).cloned()
-    }
-}
-
-struct FakeBackground {}
-
-impl Future for FakeBackground {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(())
     }
 }

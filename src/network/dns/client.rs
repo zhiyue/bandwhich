@@ -1,8 +1,7 @@
 use crate::network::dns::{resolver::Lookup, IpTable};
 use std::{
     collections::HashSet,
-    future::Future,
-    net::Ipv4Addr,
+    net::IpAddr,
     sync::{Arc, Mutex},
     thread::{Builder, JoinHandle},
 };
@@ -11,27 +10,25 @@ use tokio::{
     sync::mpsc::{self, Sender},
 };
 
-type PendingAddrs = HashSet<Ipv4Addr>;
+type PendingAddrs = HashSet<IpAddr>;
 
 const CHANNEL_SIZE: usize = 1_000;
 
 pub struct Client {
     cache: Arc<Mutex<IpTable>>,
     pending: Arc<Mutex<PendingAddrs>>,
-    tx: Option<Sender<Vec<Ipv4Addr>>>,
+    tx: Option<Sender<Vec<IpAddr>>>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Client {
-    pub fn new<R, B>(resolver: R, background: B) -> Result<Self, failure::Error>
+    pub fn new<R>(resolver: R, mut runtime: Runtime) -> Result<Self, failure::Error>
     where
         R: Lookup + Send + Sync + 'static,
-        B: Future<Output = ()> + Send + 'static,
     {
         let cache = Arc::new(Mutex::new(IpTable::new()));
         let pending = Arc::new(Mutex::new(PendingAddrs::new()));
-        let mut runtime = Runtime::new()?;
-        let (tx, mut rx) = mpsc::channel::<Vec<Ipv4Addr>>(CHANNEL_SIZE);
+        let (tx, mut rx) = mpsc::channel::<Vec<IpAddr>>(CHANNEL_SIZE);
 
         let handle = Builder::new().name("resolver".into()).spawn({
             let cache = cache.clone();
@@ -39,7 +36,6 @@ impl Client {
             move || {
                 runtime.block_on(async {
                     let resolver = Arc::new(resolver);
-                    tokio::spawn(background);
 
                     while let Some(ips) = rx.recv().await {
                         for ip in ips {
@@ -69,11 +65,11 @@ impl Client {
         })
     }
 
-    pub fn resolve(&mut self, ips: Vec<Ipv4Addr>) {
+    pub fn resolve(&mut self, ips: Vec<IpAddr>) {
         // Remove ips that are already being resolved
         let ips = ips
             .into_iter()
-            .filter(|ip| self.pending.lock().unwrap().insert(ip.clone()))
+            .filter(|ip| self.pending.lock().unwrap().insert(*ip))
             .collect::<Vec<_>>();
 
         if !ips.is_empty() {
